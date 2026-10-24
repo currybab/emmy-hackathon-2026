@@ -1,0 +1,14 @@
+[project]
+name = "ptxc"
+version = "0.1.0"
+description = "Emmy Kernel IR -> PTX compiler (Emmy Hackathon 2026)"
+requires-python = ">=3.12"
+dependencies = ["emmy-ml==0.3.11", "numpy", "requests"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["remote: compiles and runs on the hosted GPU runner (set PTXC_REMOTE=1)"]
