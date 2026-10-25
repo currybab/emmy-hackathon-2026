@@ -3,17 +3,22 @@
 `Lowerer.lower_body` walks a statement sequence in order and dispatches on the statement's
 class name. Two environments carry what earlier statements produced:
 
-    ints    axis variables (a0, a1_co, ...) -> IntValue   (s32)
-    values  SSA value names (in0, v1, ...)  -> f32 register
+    ints    axis variables (a0, a1_co, lane, ...) -> IntValue   (s32)
+    values  SSA value names (in0, acc0, ...)       -> f32 register
+
+This module covers data movement and control flow. Statements in which threads cooperate
+(Sync, WarpShuffle, TreeHalve) are lowered by cooperative.py through the public methods here.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from ptxc.builder import PtxBuilder
+from ptxc import cooperative
+from ptxc.builder import PtxBuilder, check_identifier, f32_literal
 from ptxc.errors import CompileError
-from ptxc.expr import IntValue, int_binop, lower_int_expr
+from ptxc.expr import IntValue, int_binop, lower_int_expr, lower_predicate
 from ptxc.ops import emit_elementwise
 
 F32_BYTES = 4
@@ -44,6 +49,12 @@ def _groups(regs: Sequence[str]) -> list[tuple[int, Sequence[str]]]:
     return [(i, [reg]) for i, reg in enumerate(regs)]
 
 
+def _describe(stmt: object) -> str:
+    """The statement's first line in emmy's own IR notation, for a PTX comment."""
+    pretty = getattr(stmt, "pretty", None)
+    return pretty()[0].strip() if pretty else type(stmt).__name__
+
+
 class Lowerer:
     def __init__(self, b: PtxBuilder, buffers: Mapping[str, BufferRef], ints: Mapping[str, IntValue]):
         self.b = b
@@ -54,6 +65,13 @@ class Lowerer:
             "Load": self._load,
             "Assign": self._assign,
             "Write": self._write,
+            "Accum": self._accum,
+            "StridedLoop": self._strided_loop,
+            "Cond": self._cond,
+            "Smem": self._smem,
+            "Sync": lambda s: cooperative.lower_sync(self, s),
+            "WarpShuffle": lambda s: cooperative.lower_warp_shuffle(self, s),
+            "TreeHalve": lambda s: cooperative.lower_tree_halve(self, s),
         }
 
     def lower_body(self, body: Sequence[object]) -> None:
@@ -62,21 +80,47 @@ class Lowerer:
             handler = self._handlers.get(kind)
             if handler is None:
                 raise CompileError(f"statement {kind} is not supported")
+            self.b.comment(_describe(stmt))
             handler(stmt)
 
-    # ---- lookups ---------------------------------------------------------------------------
+    # ---- environment -----------------------------------------------------------------------
 
-    def _buffer(self, name: str) -> BufferRef:
-        if name not in self.buffers:
-            raise CompileError(f"buffer {name!r} is neither a kernel parameter nor shared memory")
-        return self.buffers[name]
-
-    def _value(self, name: str) -> str:
+    def value(self, name: str) -> str:
         if name not in self.values:
             raise CompileError(f"value {name!r} is used before it is defined")
         return self.values[name]
 
-    # ---- addressing ------------------------------------------------------------------------
+    def bind(self, name: str, reg: str) -> None:
+        self.values[name] = reg
+
+    def int_value(self, name: str) -> IntValue:
+        if name not in self.ints:
+            raise CompileError(f"index variable {name!r} is not defined here")
+        return self.ints[name]
+
+    def buffer(self, name: str) -> BufferRef:
+        if name not in self.buffers:
+            raise CompileError(f"buffer {name!r} is neither a kernel parameter nor shared memory")
+        return self.buffers[name]
+
+    # ---- memory ----------------------------------------------------------------------------
+
+    def load_scalar(self, buf_name: str, offset: IntValue) -> str:
+        """A fresh f32 register loaded from element `offset` of a buffer."""
+        reg = self.b.reg("f32")
+        self._move("ld", self.buffer(buf_name), offset, [reg])
+        return reg
+
+    def store_scalar(self, buf_name: str, offset: IntValue, reg: str) -> None:
+        self._move("st", self.buffer(buf_name), offset, [reg])
+
+    def _move(self, kind: str, buf: BufferRef, offset: IntValue, regs: Sequence[str]) -> None:
+        """ld or st of consecutive f32 values starting at element `offset`."""
+        groups = _groups(regs)
+        for (_, group), address in zip(groups, self._addresses(buf, offset, groups)):
+            op = f"{kind}.{buf.space}{_vector_suffix(len(group))}.f32"
+            values = _register_list(group)
+            self.b.emit(f"{op} {values}, {address}" if kind == "ld" else f"{op} {address}, {values}")
 
     def _flat_offset(self, buf: BufferRef, index: Sequence[object]) -> IntValue:
         """Row-major element offset of an index tuple: ((i0 * d1) + i1) * d2 + i2 ..."""
@@ -106,30 +150,106 @@ class Lowerer:
             operands.append(f"[{base}+{byte}]" if byte else f"[{base}]")
         return operands
 
-    # ---- statements ------------------------------------------------------------------------
+    # ---- data statements -------------------------------------------------------------------
 
     def _load(self, s: object) -> None:
-        buf = self._buffer(s.input)
-        self.b.comment(f"{', '.join(s.names)} = load {buf.name}")
         regs = [self.b.reg("f32") for _ in s.names]
-        groups = _groups(regs)
-        offset = self._flat_offset(buf, s.index)
-        for (_, group), address in zip(groups, self._addresses(buf, offset, groups)):
-            self.b.emit(f"ld.{buf.space}{_vector_suffix(len(group))}.f32 {_register_list(group)}, {address}")
-        self.values.update(zip(s.names, regs))
+        self._move("ld", self.buffer(s.input), self._flat_offset(self.buffer(s.input), s.index), regs)
+        for name, reg in zip(s.names, regs):
+            self.bind(name, reg)
 
     def _assign(self, s: object) -> None:
         dst = self.b.reg("f32")
-        emit_elementwise(self.b, s.op.name, dst, [self._value(a) for a in s.args])
-        self.values[s.name] = dst
+        emit_elementwise(self.b, s.op.name, dst, [self.value(a) for a in s.args])
+        self.bind(s.name, dst)
 
     def _write(self, s: object) -> None:
         if s.atomic:
             raise CompileError(f"atomic write to {s.output!r} is not supported yet")
-        buf = self._buffer(s.output)
-        self.b.comment(f"{buf.name}[...] = {', '.join(s.values)}")
-        regs = [self._value(v) for v in s.values]
-        groups = _groups(regs)
-        offset = self._flat_offset(buf, s.index)
-        for (_, group), address in zip(groups, self._addresses(buf, offset, groups)):
-            self.b.emit(f"st.{buf.space}{_vector_suffix(len(group))}.f32 {address}, {_register_list(group)}")
+        buf = self.buffer(s.output)
+        self._move("st", buf, self._flat_offset(buf, s.index), [self.value(v) for v in s.values])
+
+    def _accum(self, s: object) -> None:
+        """acc = op(acc, value), or op(base, value) when the IR names a base; updated in place."""
+        if s.name not in self.values:
+            raise CompileError(f"accumulator {s.name!r} is folded before it is seeded")
+        acc = self.values[s.name]
+        first = self.value(s.base) if s.base is not None else acc
+        emit_elementwise(self.b, s.op.name, acc, [first, self.value(s.value)])
+
+    def _smem(self, s: object) -> None:
+        """A static __shared__ array: declared at module scope, addressed through a register."""
+        if s.dtype != "float":
+            raise CompileError(f"shared array {s.name!r} has unsupported dtype {s.dtype!r}")
+        if s.name in self.buffers:
+            raise CompileError(f"shared array {s.name!r} is declared twice")
+        extents = tuple(int(e) for e in s.extents)
+        nbytes = math.prod(extents) * F32_BYTES
+        align = max(s.align, F32_BYTES)
+        self.b.declare_global(f".shared .align {align} .b8 {check_identifier(s.name)}[{nbytes}];")
+        base = self.b.reg("b64")
+        self.b.emit(f"mov.u64 {base}, {s.name}")
+        self.buffers[s.name] = BufferRef(s.name, extents, base, "shared")
+
+    # ---- control flow ----------------------------------------------------------------------
+
+    def _seed_accumulators(self, body: Sequence[object], seed: bool) -> None:
+        """Before a loop: each Accum directly in its body starts at the op's identity.
+
+        Only the immediate body counts - a nested loop seeds its own (emmy's rule). With
+        `seed=False` the accumulator was set up outside the loop and is left alone.
+        """
+        seeded = set()
+        for stmt in body:
+            if type(stmt).__name__ != "Accum" or stmt.name in seeded:
+                continue
+            seeded.add(stmt.name)
+            if not seed:
+                continue
+            if stmt.op.identity is None:
+                raise CompileError(f"accumulator {stmt.name!r}: {stmt.op.name!r} has no identity")
+            reg = self.b.reg("f32")
+            self.b.emit(f"mov.f32 {reg}, {f32_literal(stmt.op.identity)}")
+            self.bind(stmt.name, reg)
+
+    def _strided_loop(self, s: object) -> None:
+        """for (axis = start; axis < end; axis += step) body   - end defaults to the axis extent."""
+        self._seed_accumulators(s.body, s.seed)
+        start = lower_int_expr(s.start, self.b, self.ints)
+        step = s.step if isinstance(s.step, int) else lower_int_expr(s.step, self.b, self.ints)
+        end = s.axis.extent.as_static() if s.end is None else lower_int_expr(s.end, self.b, self.ints)
+        counter = self.b.reg("b32")
+        self.b.emit(f"mov.s32 {counter}, {start}")
+        self._counted_loop(s.axis.name, counter, end, step, s.body)
+
+    def _counted_loop(self, var: str, counter: str, end: IntValue, step: IntValue,
+                      body: Sequence[object]) -> None:
+        """Top-tested loop; inside the body the axis variable `var` is the counter register."""
+        top, done = self.b.label(f"{var}_loop"), self.b.label(f"{var}_done")
+        self.b.place(top)
+        finished = self.b.reg("pred")
+        self.b.emit(f"setp.ge.s32 {finished}, {counter}, {end}")
+        self.b.emit(f"@{finished} bra {done}")
+        outer = self.ints
+        self.ints = {**outer, var: counter}
+        self.lower_body(body)
+        self.ints = outer
+        self.b.emit(f"add.s32 {counter}, {counter}, {step}")
+        self.b.emit(f"bra {top}")
+        self.b.place(done)
+
+    def _cond(self, s: object) -> None:
+        """if (cond) body else else_body; a predicate known at compile time keeps one branch."""
+        holds = lower_predicate(s.cond, self.b, self.ints)
+        if holds is True or holds is False:
+            self.lower_body(s.body if holds else s.else_body)
+            return
+        end = self.b.label("endif")
+        skip = self.b.label("else") if s.else_body else end
+        self.b.emit(f"@!{holds} bra {skip}")
+        self.lower_body(s.body)
+        if s.else_body:
+            self.b.emit(f"bra {end}")
+            self.b.place(skip)
+            self.lower_body(s.else_body)
+        self.b.place(end)

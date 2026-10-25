@@ -86,6 +86,50 @@ def materialize(b: PtxBuilder, value: IntValue) -> str:
     return dst
 
 
+# comparison -> (setp condition, the same comparison with its operands swapped)
+_COMPARISONS = {
+    "==": ("eq", "=="),
+    "!=": ("ne", "!="),
+    "<": ("lt", ">"),
+    "<=": ("le", ">="),
+    ">": ("gt", "<"),
+    ">=": ("ge", "<="),
+}
+_COMPARE_FOLD = {
+    "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+    "<": lambda a, b: a < b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    ">=": lambda a, b: a >= b,
+}
+
+Predicate = bool | str  # known at compile time, or a pred register
+
+
+def compare(b: PtxBuilder, op: str, left: IntValue, right: IntValue) -> Predicate:
+    """`left op right` on s32 values: a Python bool when both are constants, else one setp."""
+    if op not in _COMPARISONS:
+        raise CompileError(f"comparison {op!r} is not supported")
+    if isinstance(left, int) and isinstance(right, int):
+        return _COMPARE_FOLD[op](left, right)
+    if isinstance(left, int):
+        op = _COMPARISONS[op][1]  # 5 < x  ->  x > 5
+        left, right = right, left
+    dst = b.reg("pred")
+    b.emit(f"setp.{_COMPARISONS[op][0]}.s32 {dst}, {left}, {right}")
+    return dst
+
+
+def lower_predicate(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> Predicate:
+    """Compile a Cond predicate such as `lane == 0`."""
+    if type(expr).__name__ != "BinaryExpr" or expr.op not in _COMPARISONS:
+        raise CompileError(f"predicate {expr!r} is not a supported comparison")
+    left = lower_int_expr(expr.left, b, env)
+    right = lower_int_expr(expr.right, b, env)
+    return compare(b, expr.op, left, right)
+
+
 def lower_int_expr(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> IntValue:
     """Compile an integer expression tree; `env` maps axis and index names to values."""
     kind = type(expr).__name__

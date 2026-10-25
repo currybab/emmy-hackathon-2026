@@ -9,6 +9,6 @@ dependencies = ["emmy-ml==0.3.11", "numpy", "requests"]
 dev = ["pytest"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", "tests"]
 testpaths = ["tests"]
 markers = ["remote: compiles and runs on the hosted GPU runner (set PTXC_REMOTE=1)"]
