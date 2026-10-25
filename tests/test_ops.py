@@ -10,10 +10,10 @@ def lines(b: PtxBuilder) -> list[str]:
 
 
 @pytest.mark.parametrize("op, args, expected", [
-    # explicit .rn keeps ptxas from contracting mul+add into fma (bit-exact vs numpy)
-    ("add", ["%f1", "%f2"], "add.rn.f32 %f9, %f1, %f2;"),
-    ("subtract", ["%f1", "%f2"], "sub.rn.f32 %f9, %f1, %f2;"),
-    ("multiply", ["%f1", "%f2"], "mul.rn.f32 %f9, %f1, %f2;"),
+    # no rounding modifier: ptxas may contract mul+add into fma, as nvcc does
+    ("add", ["%f1", "%f2"], "add.f32 %f9, %f1, %f2;"),
+    ("subtract", ["%f1", "%f2"], "sub.f32 %f9, %f1, %f2;"),
+    ("multiply", ["%f1", "%f2"], "mul.f32 %f9, %f1, %f2;"),
     ("divide", ["%f1", "%f2"], "div.rn.f32 %f9, %f1, %f2;"),
     ("maximum", ["%f1", "%f2"], "max.f32 %f9, %f1, %f2;"),
     ("relu", ["%f1"], "max.f32 %f9, %f1, 0f00000000;"),

@@ -1,8 +1,9 @@
 """Elementwise f32 operations: the IR's op name -> one PTX instruction.
 
-Rounding is spelled out (`.rn`) on add/sub/mul. Without it ptxas is free to contract a
-multiply followed by an add into one `fma`, which rounds once instead of twice and no longer
-matches numpy bit for bit - and several problems check with zero tolerance.
+add/sub/mul carry no rounding modifier on purpose: that leaves ptxas free to contract a
+multiply feeding an add into one `fma` - one instruction instead of two, rounded once instead
+of twice. It is what nvcc does by default, so Emmy's reference kernels behave the same way.
+div/sqrt/rcp must name a rounding mode for f32; `.rn` is the IEEE-exact one.
 """
 from __future__ import annotations
 
@@ -15,9 +16,9 @@ _ZERO = f32_literal(0.0)
 
 # op name -> (arity, instruction template over {d} destination and {a}, {b} sources)
 _F32_OPS: dict[str, tuple[int, str]] = {
-    "add": (2, "add.rn.f32 {d}, {a}, {b}"),
-    "subtract": (2, "sub.rn.f32 {d}, {a}, {b}"),
-    "multiply": (2, "mul.rn.f32 {d}, {a}, {b}"),
+    "add": (2, "add.f32 {d}, {a}, {b}"),
+    "subtract": (2, "sub.f32 {d}, {a}, {b}"),
+    "multiply": (2, "mul.f32 {d}, {a}, {b}"),
     "divide": (2, "div.rn.f32 {d}, {a}, {b}"),
     "maximum": (2, "max.f32 {d}, {a}, {b}"),
     "relu": (1, "max.f32 {d}, {a}, " + _ZERO),

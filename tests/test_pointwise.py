@@ -42,6 +42,6 @@ def test_relu_lowers_to_max_with_zero():
     assert "max.f32" in compile_file(ir_of("p03_relu_mul"))
 
 
-def test_mul_and_add_are_never_contracted():
+def test_mul_and_add_are_left_contractible_for_ptxas():
     ptx = compile_file(ir_of("p02_scale_shift"))
-    assert "mul.rn.f32" in ptx and "add.rn.f32" in ptx and "fma" not in ptx
+    assert "mul.f32" in ptx and "add.f32" in ptx and ".rn.f32" not in ptx
