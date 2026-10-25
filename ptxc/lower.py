@@ -14,12 +14,13 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 
 from ptxc import cooperative
 from ptxc.builder import PtxBuilder, check_identifier, f32_literal
 from ptxc.errors import CompileError
 from ptxc.expr import IntValue, int_binop, lower_int_expr, lower_predicate
-from ptxc.ops import emit_elementwise
+from ptxc.elementwise import emit_elementwise
 
 F32_BYTES = 4
 VECTOR_WIDTHS = (1, 2, 4)  # PTX has v2 and v4 memory ops; other group sizes go one by one
@@ -69,9 +70,7 @@ class Lowerer:
             "StridedLoop": self._strided_loop,
             "Cond": self._cond,
             "Smem": self._smem,
-            "Sync": lambda s: cooperative.lower_sync(self, s),
-            "WarpShuffle": lambda s: cooperative.lower_warp_shuffle(self, s),
-            "TreeHalve": lambda s: cooperative.lower_tree_halve(self, s),
+            **{kind: partial(fn, self) for kind, fn in cooperative.HANDLERS.items()},
         }
 
     def lower_body(self, body: Sequence[object]) -> None:

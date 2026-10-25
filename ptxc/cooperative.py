@@ -22,6 +22,25 @@ WARP_SIZE = 32
 FULL_MASK = "0xffffffff"  # every lane of the warp takes part
 BFLY_CLAMP = "0x1f"  # shfl's c operand for a butterfly over the whole warp
 
+_WARP_COMBINES = {"WarpShuffle", "TreeHalve"}
+
+
+def uses_lane_warp(body: object) -> bool:
+    """lane/warp exist iff the body holds a warp-level combine - the same rule emmy uses."""
+    return any(
+        type(stmt).__name__ in _WARP_COMBINES or any(uses_lane_warp(child) for child in stmt.nested())
+        for stmt in body
+    )
+
+
+def lane_and_warp(b: PtxBuilder, tid: str) -> dict[str, str]:
+    """lane = tid % 32 and warp = tid / 32, as a mask and a shift."""
+    lane, warp = b.reg("b32"), b.reg("b32")
+    b.comment("lane = tid & 31, warp = tid >> 5")
+    b.emit(f"and.b32 {lane}, {tid}, {WARP_SIZE - 1}")
+    b.emit(f"shr.u32 {warp}, {tid}, {WARP_SIZE.bit_length() - 1}")
+    return {"lane": lane, "warp": warp}
+
 
 def _halvings(length: int, what: str) -> list[int]:
     """length 32 -> [16, 8, 4, 2, 1]: the strides of a halving combine."""
@@ -90,3 +109,11 @@ def lower_tree_halve(lw: Lowerer, s: object) -> None:
         barrier(lw.b, s.barrier_id, s.barrier_count)
     for buf, state in zip(s.bufs, s.state, strict=True):
         lw.bind(state, lw.load_scalar(buf, 0))
+
+
+# statement kind -> lowering function; the Lowerer registers these next to its own
+HANDLERS = {
+    "Sync": lower_sync,
+    "WarpShuffle": lower_warp_shuffle,
+    "TreeHalve": lower_tree_halve,
+}

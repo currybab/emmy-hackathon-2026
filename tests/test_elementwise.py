@@ -2,7 +2,7 @@ import pytest
 
 from ptxc.builder import PtxBuilder
 from ptxc.errors import CompileError
-from ptxc.ops import emit_elementwise
+from ptxc.elementwise import emit_elementwise
 
 
 def lines(b: PtxBuilder) -> list[str]:

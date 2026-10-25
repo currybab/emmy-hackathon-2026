@@ -4,8 +4,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+from ptxc import cooperative
 from ptxc.builder import PtxBuilder
-from ptxc.cooperative import WARP_SIZE
 from ptxc.errors import CompileError
 from ptxc.expr import IntValue
 from ptxc.loader import KernelSpec, load_kernel
@@ -25,8 +25,8 @@ def compile_kernel(spec: KernelSpec) -> str:
     tid, gid = _thread_ids(b)
     cells = _tile_cells(tile)
     ints = _decode_axes(b, tile, gid)
-    if _uses_lane_warp(tile.body):
-        ints = {**ints, **_lane_and_warp(b, tid)}
+    if cooperative.uses_lane_warp(tile.body):
+        ints = {**ints, **cooperative.lane_and_warp(b, tid)}
 
     exit_label = _guard(b, gid, cells) if spec.total_threads > cells else None
 
@@ -69,26 +69,6 @@ def _thread_ids(b: PtxBuilder) -> tuple[str, str]:
     b.emit(f"mov.u32 {tid}, %tid.x")
     b.emit(f"mad.lo.s32 {gid}, {ctaid}, {ntid}, {tid}")
     return tid, gid
-
-
-_WARP_COMBINES = {"WarpShuffle", "TreeHalve"}
-
-
-def _uses_lane_warp(body: object) -> bool:
-    """lane/warp exist iff the body holds a warp-level combine - the same rule emmy uses."""
-    return any(
-        type(stmt).__name__ in _WARP_COMBINES or any(_uses_lane_warp(child) for child in stmt.nested())
-        for stmt in body
-    )
-
-
-def _lane_and_warp(b: PtxBuilder, tid: str) -> dict[str, str]:
-    """lane = tid % 32 and warp = tid / 32, as a mask and a shift."""
-    lane, warp = b.reg("b32"), b.reg("b32")
-    b.comment("lane = tid & 31, warp = tid >> 5")
-    b.emit(f"and.b32 {lane}, {tid}, {WARP_SIZE - 1}")
-    b.emit(f"shr.u32 {warp}, {tid}, {WARP_SIZE.bit_length() - 1}")
-    return {"lane": lane, "warp": warp}
 
 
 def _tile_cells(tile: object) -> int:
