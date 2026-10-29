@@ -20,7 +20,7 @@ from functools import partial
 from ptxc import async_copy, cooperative
 from ptxc.builder import PtxBuilder, check_identifier, f32_literal
 from ptxc.errors import CompileError
-from ptxc.expr import IntValue, int_binop, lower_int_expr, lower_predicate
+from ptxc.expr import Affine, IntValue, affine_add, affine_scale, as_affine, lower_affine, lower_int_expr, lower_predicate
 from ptxc.elementwise import emit_elementwise
 
 F32_BYTES = 4
@@ -119,13 +119,13 @@ class Lowerer:
     def load_scalar(self, buf_name: str, offset: IntValue) -> str:
         """A fresh f32 register loaded from element `offset` of a buffer."""
         reg = self.b.reg("f32")
-        self._move("ld", self.buffer(buf_name), offset, [reg])
+        self._move("ld", self.buffer(buf_name), as_affine(offset), [reg])
         return reg
 
     def store_scalar(self, buf_name: str, offset: IntValue, reg: str) -> None:
-        self._move("st", self.buffer(buf_name), offset, [reg])
+        self._move("st", self.buffer(buf_name), as_affine(offset), [reg])
 
-    def _move(self, kind: str, buf: BufferRef, offset: IntValue, regs: Sequence[str]) -> None:
+    def _move(self, kind: str, buf: BufferRef, offset: Affine, regs: Sequence[str]) -> None:
         """ld or st of consecutive f32 values starting at element `offset`."""
         groups = _groups(regs)
         for (_, group), address in zip(groups, self._addresses(buf, offset, groups)):
@@ -133,32 +133,44 @@ class Lowerer:
             values = _register_list(group)
             self.b.emit(f"{op} {values}, {address}" if kind == "ld" else f"{op} {address}, {values}")
 
-    def flat_offset(self, buf: BufferRef, index: Sequence[object]) -> IntValue:
-        """Row-major element offset of an index tuple: ((i0 * d1) + i1) * d2 + i2 ..."""
+    def flat_offset(self, buf: BufferRef, index: Sequence[object]) -> Affine:
+        """Row-major element offset of an index tuple: ((i0 * d1) + i1) * d2 + i2 ...
+
+        Kept as (variable, constant) so the constant becomes the address immediate.
+        """
         if not index:
-            return 0  # `sum_1[] = ...`: the buffer's only element
+            return (0, 0)  # `sum_1[] = ...`: the buffer's only element
         if len(index) != len(buf.shape):
             raise CompileError(f"{buf.name}: {len(index)} indices for a {len(buf.shape)}-d buffer")
-        offset: IntValue = 0
+        offset: Affine = (0, 0)
         for expr, dim in zip(index, buf.shape):
-            scaled = int_binop(self.b, "*", offset, dim)
-            offset = int_binop(self.b, "+", scaled, lower_int_expr(expr, self.b, self.ints))
+            offset = affine_add(self.b, affine_scale(self.b, offset, dim), lower_affine(expr, self.b, self.ints))
         return offset
 
-    def address(self, buf: BufferRef, offset: IntValue) -> str:
+    def address(self, buf: BufferRef, offset: Affine) -> str:
         """The `[addr]` operand of element `offset` of a buffer."""
         return self._addresses(buf, offset, [(0, None)])[0]
 
-    def _addresses(self, buf: BufferRef, offset: IntValue, groups: list) -> list[str]:
+    def _element_address(self, buf: BufferRef, index: str) -> str:
+        """base + 4 * index as a 64-bit address, computed once per (buffer, index)."""
+        key = ("address", buf.base, index)
+        known = self.b.known(key)
+        if known is not None:
+            return known
+        byte_offset = self.b.reg("b64")
+        address = self.b.reg("b64")
+        self.b.emit(f"mul.wide.s32 {byte_offset}, {index}, {F32_BYTES}")
+        self.b.emit(f"add.s64 {address}, {buf.base}, {byte_offset}")
+        self.b.remember(key, address)
+        return address
+
+    def _addresses(self, buf: BufferRef, offset: Affine, groups: list) -> list[str]:
         """The `[addr]` operand of each group; one 64-bit add serves them all."""
-        if isinstance(offset, int):
-            base, first = buf.base, offset
+        variable, first = offset
+        if isinstance(variable, int):
+            base, first = buf.base, variable + first
         else:
-            byte_offset = self.b.reg("b64")
-            base = self.b.reg("b64")
-            self.b.emit(f"mul.wide.s32 {byte_offset}, {offset}, {F32_BYTES}")
-            self.b.emit(f"add.s64 {base}, {buf.base}, {byte_offset}")
-            first = 0
+            base = self._element_address(buf, variable)
         operands = []
         for element, _ in groups:
             byte = (first + element) * F32_BYTES
@@ -276,6 +288,8 @@ class Lowerer:
         end = s.axis.extent.as_static() if s.end is None else lower_int_expr(s.end, self.b, self.ints)
         counter = self.b.reg("b32")
         self.b.emit(f"mov.s32 {counter}, {start}")
+        if self.b.is_non_negative(start) and isinstance(step, int) and step > 0:
+            self.b.mark_non_negative(counter)  # it only counts up from there
         self._counted_loop(s.axis.name, counter, end, step, s.body)
 
     def _loop(self, s: object) -> None:
@@ -287,6 +301,7 @@ class Lowerer:
             return
         counter = self.b.reg("b32")
         self.b.emit(f"mov.s32 {counter}, 0")
+        self.b.mark_non_negative(counter)
         self._counted_loop(s.axis.name, counter, extent, 1, s.body)
 
     def _unrolled(self, var: str, extent: int, body: Sequence[object]) -> None:
@@ -309,7 +324,8 @@ class Lowerer:
         self.b.emit(f"@{finished} bra {done}")
         outer = self.ints
         self.ints = {**outer, var: counter}
-        self.lower_body(body)
+        with self.b.region():
+            self.lower_body(body)
         self.ints = outer
         self.b.emit(f"add.s32 {counter}, {counter}, {step}")
         self.b.emit(f"bra {top}")
@@ -324,9 +340,11 @@ class Lowerer:
         end = self.b.label("endif")
         skip = self.b.label("else") if s.else_body else end
         self.b.emit(f"@!{holds} bra {skip}")
-        self.lower_body(s.body)
+        with self.b.region():
+            self.lower_body(s.body)
         if s.else_body:
             self.b.emit(f"bra {end}")
             self.b.place(skip)
-            self.lower_body(s.else_body)
+            with self.b.region():
+                self.lower_body(s.else_body)
         self.b.place(end)

@@ -66,6 +66,8 @@ def _thread_ids(b: PtxBuilder) -> tuple[str, str]:
     b.emit(f"mov.u32 {ntid}, %ntid.x")
     b.emit(f"mov.u32 {tid}, %tid.x")
     b.emit(f"mad.lo.s32 {gid}, {ctaid}, {ntid}, {tid}")
+    for reg in (tid, gid):
+        b.mark_non_negative(reg)
     return tid, gid
 
 
@@ -88,6 +90,8 @@ def _decode_axes(b: PtxBuilder, tile: object, gid: str) -> dict[str, IntValue]:
         index, quotient = b.reg("b32"), b.reg("b32")
         b.emit(f"rem.u32 {index}, {rest}, {extent}")
         b.emit(f"div.u32 {quotient}, {rest}, {extent}")
+        b.mark_non_negative(index)
+        b.mark_non_negative(quotient)
         ints[axis.name] = index
         rest = quotient
     ints[tile.axes[0].name] = rest

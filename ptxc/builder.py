@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 import struct
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 
 from ptxc.errors import CompileError
 
@@ -50,6 +51,33 @@ class PtxBuilder:
         self._label_count = 0
         self._lines: list[str] = []
         self._globals: list[str] = []
+        # integer results already computed on every path to the current point, by what they compute
+        self._known: dict[tuple, str] = {}
+        self._non_negative: set[str] = set()
+
+    # ---- reuse of integer work ------------------------------------------------------------
+
+    def known(self, key: tuple) -> str | None:
+        return self._known.get(key)
+
+    def remember(self, key: tuple, reg: str) -> None:
+        self._known[key] = reg
+
+    @contextmanager
+    def region(self) -> Iterator[None]:
+        """Code that not every thread runs, or that runs again with new values (a branch, a
+        loop body): what it computes cannot be reused once it is left."""
+        outer = dict(self._known)
+        try:
+            yield
+        finally:
+            self._known = outer
+
+    def mark_non_negative(self, reg: str) -> None:
+        self._non_negative.add(reg)
+
+    def is_non_negative(self, value: int | str) -> bool:
+        return value >= 0 if isinstance(value, int) else value in self._non_negative
 
     def reg(self, cls: str) -> str:
         """A fresh virtual register of class `cls` (pred, b32, b64 or f32)."""

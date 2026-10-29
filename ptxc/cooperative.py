@@ -39,6 +39,8 @@ def lane_and_warp(b: PtxBuilder, tid: str) -> dict[str, str]:
     b.comment("lane = tid & 31, warp = tid >> 5")
     b.emit(f"and.b32 {lane}, {tid}, {WARP_SIZE - 1}")
     b.emit(f"shr.u32 {warp}, {tid}, {WARP_SIZE.bit_length() - 1}")
+    b.mark_non_negative(lane)
+    b.mark_non_negative(warp)
     return {"lane": lane, "warp": warp}
 
 
@@ -98,13 +100,14 @@ def lower_tree_halve(lw: Lowerer, s: object) -> None:
             raise CompileError(f"TreeHalve index {s.tid_var!r} must vary across threads")
         skip = lw.b.label("tree_skip")
         lw.b.emit(f"@!{active} bra {skip}")
-        partner = int_binop(lw.b, "+", tid, stride)
-        for buf, state, other in zip(s.bufs, s.state, s.state_b, strict=True):
-            lw.bind(state, lw.load_scalar(buf, tid))
-            lw.bind(other, lw.load_scalar(buf, partner))
-        lw.lower_body(s.combine_states)
-        for buf, state in zip(s.bufs, s.state, strict=True):
-            lw.store_scalar(buf, tid, lw.value(state))
+        with lw.b.region():  # only the threads below the stride run this
+            partner = int_binop(lw.b, "+", tid, stride)
+            for buf, state, other in zip(s.bufs, s.state, s.state_b, strict=True):
+                lw.bind(state, lw.load_scalar(buf, tid))
+                lw.bind(other, lw.load_scalar(buf, partner))
+            lw.lower_body(s.combine_states)
+            for buf, state in zip(s.bufs, s.state, strict=True):
+                lw.store_scalar(buf, tid, lw.value(state))
         lw.b.place(skip)
         barrier(lw.b, s.barrier_id, s.barrier_count)
     for buf, state in zip(s.bufs, s.state, strict=True):

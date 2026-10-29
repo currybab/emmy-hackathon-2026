@@ -21,6 +21,9 @@ _INSTRUCTION = {
     "%": "rem.s32",
 }
 _COMMUTATIVE = {"+", "*"}
+# a non-negative dividend and a positive constant divisor: C's truncating division agrees with
+# the unsigned one, which is a shift or a multiply-high instead of a signed-division sequence
+_UNSIGNED = {"/": "div.u32", "%": "rem.u32"}
 
 
 def _c_div(a: int, b: int) -> int:
@@ -58,7 +61,8 @@ def _simplify(op: str, left: IntValue, right: IntValue) -> IntValue | None:
 
 
 def int_binop(b: PtxBuilder, op: str, left: IntValue, right: IntValue) -> IntValue:
-    """`left op right` with C int semantics, folded when possible, else one instruction."""
+    """`left op right` with C int semantics: folded when possible, reused when already
+    computed, else one instruction."""
     if op not in _INSTRUCTION:
         raise CompileError(f"integer operator {op!r} is not supported")
     if isinstance(left, int) and isinstance(right, int):
@@ -72,8 +76,16 @@ def int_binop(b: PtxBuilder, op: str, left: IntValue, right: IntValue) -> IntVal
             left, right = right, left
         else:
             left = materialize(b, left)
+    key = (op, left, right)
+    known = b.known(key)
+    if known is not None:
+        return known
+    unsigned = op in _UNSIGNED and b.is_non_negative(left) and isinstance(right, int) and right > 0
     dst = b.reg("b32")
-    b.emit(f"{_INSTRUCTION[op]} {dst}, {left}, {right}")
+    b.emit(f"{_UNSIGNED[op] if unsigned else _INSTRUCTION[op]} {dst}, {left}, {right}")
+    if unsigned or (op in _COMMUTATIVE and b.is_non_negative(left) and b.is_non_negative(right)):
+        b.mark_non_negative(dst)
+    b.remember(key, dst)
     return dst
 
 
@@ -83,7 +95,61 @@ def materialize(b: PtxBuilder, value: IntValue) -> str:
         return value
     dst = b.reg("b32")
     b.emit(f"mov.s32 {dst}, {value}")
+    if value >= 0:
+        b.mark_non_negative(dst)
     return dst
+
+
+# ---- affine offsets ---------------------------------------------------------------------
+#
+# An Affine (variable, constant) is the value variable + constant. Memory offsets are kept in
+# this form so the constant ends up in the address immediate `[base+imm]`, where it is free.
+# ptxas cannot do this itself: PTX adds wrap, and the index is sign-extended to 64 bits, so
+# `4 * (t + 3)` is not provably `4*t + 12`. Emmy's indices never overflow, so we may.
+
+Affine = tuple[IntValue, int]
+
+
+def as_affine(value: IntValue) -> Affine:
+    return (0, value) if isinstance(value, int) else (value, 0)
+
+
+def affine_value(b: PtxBuilder, x: Affine) -> IntValue:
+    """Collapse to a single value (one add when both parts are present)."""
+    return int_binop(b, "+", x[0], x[1])
+
+
+def affine_add(b: PtxBuilder, x: Affine, y: Affine) -> Affine:
+    return int_binop(b, "+", x[0], y[0]), x[1] + y[1]
+
+
+def affine_scale(b: PtxBuilder, x: Affine, k: int) -> Affine:
+    return int_binop(b, "*", x[0], k), x[1] * k
+
+
+def lower_affine(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> Affine:
+    """Like lower_int_expr, but constant terms stay apart: (t + 1) * 64 -> (t*64, 64).
+
+    Only + - and multiplication by a constant distribute; / % and selects collapse first.
+    """
+    kind = type(expr).__name__
+    if kind in ("Literal", "Var"):
+        return as_affine(lower_int_expr(expr, b, env))
+    if kind == "BinaryExpr" and expr.op in ("+", "-", "*"):
+        left, right = lower_affine(expr.left, b, env), lower_affine(expr.right, b, env)
+        if expr.op == "+":
+            return affine_add(b, left, right)
+        if expr.op == "-":
+            return int_binop(b, "-", left[0], right[0]), left[1] - right[1]
+        if left[0] == 0:
+            return affine_scale(b, right, left[1])
+        if right[0] == 0:
+            return affine_scale(b, left, right[1])
+        return as_affine(int_binop(b, "*", affine_value(b, left), affine_value(b, right)))
+    if kind == "BinaryExpr":
+        left, right = lower_affine(expr.left, b, env), lower_affine(expr.right, b, env)
+        return as_affine(int_binop(b, expr.op, affine_value(b, left), affine_value(b, right)))
+    return as_affine(lower_int_expr(expr, b, env))
 
 
 # comparison -> (setp condition, the same comparison with its operands swapped)

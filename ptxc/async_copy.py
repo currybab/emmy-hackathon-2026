@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ptxc.errors import CompileError
-from ptxc.expr import int_binop, lower_int_expr
+from ptxc.expr import affine_add, affine_scale, lower_affine
 
 if TYPE_CHECKING:
     from ptxc.lower import Lowerer
@@ -30,9 +30,9 @@ def lower_copy(lw: Lowerer, s: object) -> None:
     dst_offset = lw.flat_offset(smem, s.smem_index)
     if s.lane_index is not None:
         # smem_index is the base of a stripe; the lane adds its own (row, col) inside it
-        row, col = (lower_int_expr(e, lw.b, lw.ints) for e in s.lane_index)
-        lane = int_binop(lw.b, "+", int_binop(lw.b, "*", row, smem.shape[-1]), col)
-        dst_offset = int_binop(lw.b, "+", dst_offset, lane)
+        row, col = (lower_affine(e, lw.b, lw.ints) for e in s.lane_index)
+        lane = affine_add(lw.b, affine_scale(lw.b, row, smem.shape[-1]), col)
+        dst_offset = affine_add(lw.b, dst_offset, lane)
     dst = lw.address(smem, dst_offset)
     source = lw.address(src, lw.flat_offset(src, s.src_index))
     cache = "cg" if s.nbytes == CG_BYTES else "ca"
