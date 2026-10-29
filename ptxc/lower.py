@@ -7,7 +7,8 @@ class name. Two environments carry what earlier statements produced:
     values  SSA value names (in0, acc0, ...)       -> f32 register
 
 This module covers data movement and control flow. Statements in which threads cooperate
-(Sync, WarpShuffle, TreeHalve) are lowered by cooperative.py through the public methods here.
+(Sync, WarpShuffle, TreeHalve) are lowered by cooperative.py, and cp.async copies by
+async_copy.py, both through the public methods here.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 
-from ptxc import cooperative
+from ptxc import async_copy, cooperative
 from ptxc.builder import PtxBuilder, check_identifier, f32_literal
 from ptxc.errors import CompileError
 from ptxc.expr import IntValue, int_binop, lower_int_expr, lower_predicate
@@ -24,6 +25,9 @@ from ptxc.elementwise import emit_elementwise
 
 F32_BYTES = 4
 VECTOR_WIDTHS = (1, 2, 4)  # PTX has v2 and v4 memory ops; other group sizes go one by one
+MAX_UNROLL = 128  # an unrolled Loop longer than this stays a loop
+SMEM_POOL = "smem_pool"
+POOL_ALIGN = 16
 
 
 @dataclass(frozen=True)
@@ -57,21 +61,28 @@ def _describe(stmt: object) -> str:
 
 
 class Lowerer:
-    def __init__(self, b: PtxBuilder, buffers: Mapping[str, BufferRef], ints: Mapping[str, IntValue]):
+    def __init__(self, b: PtxBuilder, buffers: Mapping[str, BufferRef], ints: Mapping[str, IntValue],
+                 smem_pool_bytes: int = 0):
         self.b = b
         self.buffers = dict(buffers)
         self.ints: dict[str, IntValue] = dict(ints)
         self.values: dict[str, str] = {}
+        # > 0: the launch gives this much dynamic shared memory and Smem arrays live in it
+        self.smem_pool_bytes = smem_pool_bytes
+        self._pool_used = 0
         self._handlers = {
             "Load": self._load,
             "Assign": self._assign,
             "Let": self._let,
+            "Init": self._init,
             "Write": self._write,
             "Accum": self._accum,
             "StridedLoop": self._strided_loop,
+            "Loop": self._loop,
             "Cond": self._cond,
             "Smem": self._smem,
             **{kind: partial(fn, self) for kind, fn in cooperative.HANDLERS.items()},
+            **{kind: partial(fn, self) for kind, fn in async_copy.HANDLERS.items()},
         }
 
     def lower_body(self, body: Sequence[object]) -> None:
@@ -122,7 +133,7 @@ class Lowerer:
             values = _register_list(group)
             self.b.emit(f"{op} {values}, {address}" if kind == "ld" else f"{op} {address}, {values}")
 
-    def _flat_offset(self, buf: BufferRef, index: Sequence[object]) -> IntValue:
+    def flat_offset(self, buf: BufferRef, index: Sequence[object]) -> IntValue:
         """Row-major element offset of an index tuple: ((i0 * d1) + i1) * d2 + i2 ..."""
         if not index:
             return 0  # `sum_1[] = ...`: the buffer's only element
@@ -133,6 +144,10 @@ class Lowerer:
             scaled = int_binop(self.b, "*", offset, dim)
             offset = int_binop(self.b, "+", scaled, lower_int_expr(expr, self.b, self.ints))
         return offset
+
+    def address(self, buf: BufferRef, offset: IntValue) -> str:
+        """The `[addr]` operand of element `offset` of a buffer."""
+        return self._addresses(buf, offset, [(0, None)])[0]
 
     def _addresses(self, buf: BufferRef, offset: IntValue, groups: list) -> list[str]:
         """The `[addr]` operand of each group; one 64-bit add serves them all."""
@@ -154,7 +169,7 @@ class Lowerer:
 
     def _load(self, s: object) -> None:
         regs = [self.b.reg("f32") for _ in s.names]
-        self._move("ld", self.buffer(s.input), self._flat_offset(self.buffer(s.input), s.index), regs)
+        self._move("ld", self.buffer(s.input), self.flat_offset(self.buffer(s.input), s.index), regs)
         for name, reg in zip(s.names, regs):
             self.bind(name, reg)
 
@@ -172,11 +187,24 @@ class Lowerer:
         self.b.emit(f"mov.f32 {reg}, {f32_literal(literal.value)}")
         self.bind(s.name, reg)
 
+    def _init(self, s: object) -> None:
+        """An accumulator set up before the code that folds into it (`Init(f32 acc = 0.0)`)."""
+        reg = self.b.reg("f32")
+        self.b.emit(f"mov.f32 {reg}, {f32_literal(s.identity)}")
+        self.bind(s.name, reg)
+
     def _write(self, s: object) -> None:
-        if s.atomic:
-            raise CompileError(f"atomic write to {s.output!r} is not supported yet")
         buf = self.buffer(s.output)
-        self._move("st", buf, self._flat_offset(buf, s.index), [self.value(v) for v in s.values])
+        offset = self.flat_offset(buf, s.index)
+        regs = [self.value(v) for v in s.values]
+        if not s.atomic:
+            self._move("st", buf, offset, regs)
+            return
+        # `out[i] += v (atomic)`: several blocks add partial sums into the same element.
+        # red is atom without a result - nobody reads the old value back.
+        groups = [(i, [reg]) for i, reg in enumerate(regs)]
+        for (_, (reg,)), address in zip(groups, self._addresses(buf, offset, groups)):
+            self.b.emit(f"red.{buf.space}.add.f32 {address}, {reg}")
 
     def _accum(self, s: object) -> None:
         """acc = op(acc, value), or op(base, value) when the IR names a base; updated in place."""
@@ -195,10 +223,29 @@ class Lowerer:
         extents = tuple(int(e) for e in s.extents)
         nbytes = math.prod(extents) * F32_BYTES
         align = max(s.align, F32_BYTES)
-        self.b.declare_global(f".shared .align {align} .b8 {check_identifier(s.name)}[{nbytes}];")
         base = self.b.reg("b64")
-        self.b.emit(f"mov.u64 {base}, {s.name}")
+        if self.smem_pool_bytes:
+            self._carve_from_pool(s.name, base, nbytes, align)
+        else:
+            self.b.declare_global(f".shared .align {align} .b8 {check_identifier(s.name)}[{nbytes}];")
+            self.b.emit(f"mov.u64 {base}, {s.name}")
         self.buffers[s.name] = BufferRef(s.name, extents, base, "shared")
+
+    def _carve_from_pool(self, name: str, base: str, nbytes: int, align: int) -> None:
+        """Past 48 KB a kernel cannot declare shared arrays statically: the launch hands it a
+        dynamic pool (meta.json `smem_bytes`) and each array takes the next aligned slice."""
+        if align > POOL_ALIGN:
+            raise CompileError(f"shared array {name!r} wants {align}-byte alignment; the pool has {POOL_ALIGN}")
+        offset = -(-self._pool_used // align) * align  # round up to the alignment
+        if offset + nbytes > self.smem_pool_bytes:
+            raise CompileError(f"shared array {name!r} does not fit the {self.smem_pool_bytes}-byte "
+                               f"dynamic pool ({offset + nbytes} bytes needed)")
+        if self._pool_used == 0:
+            self.b.declare_global(f".extern .shared .align {POOL_ALIGN} .b8 {SMEM_POOL}[];")
+        self._pool_used = offset + nbytes
+        self.b.emit(f"mov.u64 {base}, {SMEM_POOL}")
+        if offset:
+            self.b.emit(f"add.s64 {base}, {base}, {offset}")
 
     # ---- control flow ----------------------------------------------------------------------
 
@@ -230,6 +277,27 @@ class Lowerer:
         counter = self.b.reg("b32")
         self.b.emit(f"mov.s32 {counter}, {start}")
         self._counted_loop(s.axis.name, counter, end, step, s.body)
+
+    def _loop(self, s: object) -> None:
+        """for (axis = 0; axis < extent; axis++) body - unrolled when the IR asks for it."""
+        self._seed_accumulators(s.body, s.seed)
+        extent = s.axis.extent.as_static()
+        if s.unroll and extent <= MAX_UNROLL:
+            self._unrolled(s.axis.name, extent, s.body)
+            return
+        counter = self.b.reg("b32")
+        self.b.emit(f"mov.s32 {counter}, 0")
+        self._counted_loop(s.axis.name, counter, extent, 1, s.body)
+
+    def _unrolled(self, var: str, extent: int, body: Sequence[object]) -> None:
+        """One copy of the body per iteration, with the axis variable a compile-time int:
+        index math on it folds away, so `tile[k][col]` becomes base + col + an immediate."""
+        outer = self.ints
+        for i in range(extent):
+            self.b.comment(f"{var} = {i}")
+            self.ints = {**outer, var: i}
+            self.lower_body(body)
+        self.ints = outer
 
     def _counted_loop(self, var: str, counter: str, end: IntValue, step: IntValue,
                       body: Sequence[object]) -> None:

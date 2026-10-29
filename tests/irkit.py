@@ -4,10 +4,10 @@ from emmy.compiler.dim import Dim
 from emmy.compiler.dtype import F32
 from emmy.compiler.ir.axis import Axis
 from emmy.compiler.ir.elementwise import ElementwiseImpl
-from emmy.compiler.ir.expr import BinaryExpr, Literal, Var
-from emmy.compiler.ir.kernel.ir import Smem, Sync, TreeHalve, WarpShuffle
-from emmy.compiler.ir.stmt.blocks import Cond, StridedLoop
-from emmy.compiler.ir.stmt.leaves import Accum, Assign, Let, Load, Write
+from emmy.compiler.ir.expr import BinaryExpr, Literal, TernaryExpr, Var
+from emmy.compiler.ir.kernel.ir import CpAsyncCommit, CpAsyncCopy, CpAsyncWait, Smem, Sync, TreeHalve, WarpShuffle
+from emmy.compiler.ir.stmt.blocks import Cond, Loop, StridedLoop
+from emmy.compiler.ir.stmt.leaves import Accum, Assign, Init, Let, Load, Write
 
 from ptxc.builder import PtxBuilder
 from ptxc.lower import BufferRef, Lowerer
@@ -120,11 +120,41 @@ def tree_halve(buf: str, length: int, state: str = "acc0") -> TreeHalve:
     )
 
 
-def lowerer(ints=None, buffers=("x", "out")) -> tuple[PtxBuilder, Lowerer]:
+def ternary(cond, if_true, if_false) -> TernaryExpr:
+    return TernaryExpr(cond=cond, if_true=if_true, if_false=if_false)
+
+
+def init(name: str, value: float = 0.0) -> Init:
+    return Init(name=name, identity=value, dtype=F32)
+
+
+def loop(name: str, extent: int, body, unroll: bool = False) -> Loop:
+    return Loop(axis=axis(name, extent), body=tuple(body), unroll=unroll, seed=False)
+
+
+def atomic_add(buf: str, value: str, *index) -> Write:
+    return Write(output=buf, index=tuple(index), values=(value,), value_dtype=F32, atomic=True, swizzle="NONE")
+
+
+def cp_async(smem_buf: str, smem_index, src: str, src_index, nbytes: int = 16, lane=None) -> CpAsyncCopy:
+    return CpAsyncCopy(smem=smem_buf, smem_index=tuple(smem_index), src=src, src_index=tuple(src_index),
+                       nbytes=nbytes, swizzle="NONE", lane_index=None if lane is None else tuple(lane),
+                       lane_rows=0)
+
+
+def cp_async_commit() -> CpAsyncCommit:
+    return CpAsyncCommit()
+
+
+def cp_async_wait(groups: int) -> CpAsyncWait:
+    return CpAsyncWait(group=groups)
+
+
+def lowerer(ints=None, buffers=("x", "out"), smem_pool_bytes: int = 0) -> tuple[PtxBuilder, Lowerer]:
     """A Lowerer over 1-D global f32 buffers of 1024 elements each."""
     b = PtxBuilder()
     refs = {name: BufferRef(name, (1024,), b.reg("b64"), "global") for name in buffers}
-    return b, Lowerer(b, refs, ints or {})
+    return b, Lowerer(b, refs, ints or {}, smem_pool_bytes=smem_pool_bytes)
 
 
 def body_text(b: PtxBuilder) -> list[str]:

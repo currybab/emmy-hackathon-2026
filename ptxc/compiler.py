@@ -7,7 +7,7 @@ from pathlib import Path
 from ptxc import cooperative
 from ptxc.builder import PtxBuilder
 from ptxc.errors import CompileError
-from ptxc.expr import IntValue
+from ptxc.expr import IntValue, int_binop, materialize
 from ptxc.loader import KernelSpec, load_kernel
 from ptxc.lower import BufferRef, Lowerer
 
@@ -30,7 +30,7 @@ def compile_kernel(spec: KernelSpec) -> str:
 
     exit_label = _guard(b, gid, cells) if spec.total_threads > cells else None
 
-    Lowerer(b, buffers, ints).lower_body(tile.body)
+    Lowerer(b, buffers, ints, smem_pool_bytes=spec.smem_bytes).lower_body(tile.body)
 
     if exit_label:
         b.place(exit_label)
@@ -43,10 +43,8 @@ def _check_launch(spec: KernelSpec) -> None:
         raise CompileError(f"{spec.name}: only 1-D launches are supported, got "
                            f"grid {spec.grid} block {spec.block}")
     tile = spec.tile
-    if tile.raster_axes is not None:
-        raise CompileError(f"{spec.name}: rastered Tiles are not supported yet")
-    if any(axis.window is not None for axis in tile.axes):
-        raise CompileError(f"{spec.name}: windowed Tile axes are not supported yet")
+    if tile.aux_threads:
+        raise CompileError(f"{spec.name}: warp-specialized Tiles (aux threads) are not supported")
 
 
 def _load_params(b: PtxBuilder, spec: KernelSpec) -> dict[str, BufferRef]:
@@ -80,6 +78,9 @@ def _decode_axes(b: PtxBuilder, tile: object, gid: str) -> dict[str, IntValue]:
 
     Tile[a0, a1_co] with extents (64, 128):  a1_co = gid % 128,  a0 = gid / 128
     """
+    raster = _raster(tile)
+    if raster is not None:
+        return _decode_rastered(b, tile, gid, *raster)
     ints: dict[str, IntValue] = {}
     rest = gid
     for axis in reversed(tile.axes[1:]):
@@ -102,3 +103,62 @@ def _guard(b: PtxBuilder, gid: str, cells: int) -> str:
     b.emit(f"setp.ge.u32 {out_of_range}, {gid}, {cells}")
     b.emit(f"@{out_of_range} bra {exit_label}")
     return exit_label
+
+
+def _raster(tile: object) -> tuple[int, int, int] | None:
+    """(grouped axis, other axis, group size) when the Tile reorders its blocks, else None.
+
+    `raster_axes` names the block axes (m, n), adjacent in the Tile; `raster_orient` says which
+    one is grouped. A group of one block, or an axis of one block, changes nothing.
+    """
+    if not tile.raster_group or not tile.raster_axes:
+        return None
+    names = [axis.name for axis in tile.axes]
+    m, n = tile.raster_axes
+    if m not in names or n not in names or names.index(n) != names.index(m) + 1:
+        return None
+    mi, ni = names.index(m), names.index(n)
+    grouped, other = (mi, ni) if tile.raster_orient == "m" else (ni, mi)
+    extent = tile.axes[grouped].extent.as_static()
+    group = min(tile.raster_group, extent)
+    return (grouped, other, group) if extent > 1 and group > 1 else None
+
+
+def _decode_rastered(b: PtxBuilder, tile: object, gid: str, grouped: int, other: int,
+                     group: int) -> dict[str, IntValue]:
+    """Row-major decode, except that the two block axes walk `group` blocks of the grouped
+    axis before stepping the other one: neighbouring blocks then read the same slab of the
+    shared operand while it is still in L2 (the standard threadblock swizzle).
+
+        sub = flat (grouped, other) block id;  span = group * other_extent
+        grouped = (sub / span) * group + (sub % span) % width
+        other   = (sub % span) / width         width = min(group, extent - first row of the group)
+    """
+    extents = [axis.extent.as_static() for axis in tile.axes]
+    strides = [math.prod(extents[i + 1:]) for i in range(len(extents))]
+    first, second = min(grouped, other), max(grouped, other)
+    b.comment(f"block raster: groups of {group} along {tile.axes[grouped].name}")
+    sub = int_binop(b, "/", gid, strides[second])
+    if first != 0:
+        sub = int_binop(b, "%", sub, extents[grouped] * extents[other])
+    span = group * extents[other]
+    group_index = int_binop(b, "/", sub, span)
+    within = int_binop(b, "%", sub, span)
+    if extents[grouped] % group == 0:
+        width: IntValue = group
+    else:  # the last group is ragged
+        left = int_binop(b, "-", extents[grouped], int_binop(b, "*", group_index, group))
+        width = b.reg("b32")
+        b.emit(f"min.s32 {width}, {materialize(b, left)}, {group}")
+    ints: dict[str, IntValue] = {}
+    for i, axis in enumerate(tile.axes):
+        if i == grouped:
+            start = int_binop(b, "*", group_index, group)
+            ints[axis.name] = int_binop(b, "+", start, int_binop(b, "%", within, width))
+        elif i == other:
+            ints[axis.name] = int_binop(b, "/", within, width)
+        else:
+            index = int_binop(b, "/", gid, strides[i])
+            ints[axis.name] = index if i == 0 else int_binop(b, "%", index, extents[i])
+    b.comment("Tile axes: " + ", ".join(f"{name} = {value}" for name, value in ints.items()))
+    return ints

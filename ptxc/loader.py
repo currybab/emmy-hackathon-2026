@@ -30,6 +30,7 @@ class KernelSpec:
     params: tuple[Buffer, ...]  # in meta.json arg_order
     grid: tuple[int, int, int]
     block: tuple[int, int, int]
+    smem_bytes: int  # dynamic shared memory the launch provides (0: static arrays only)
 
     @property
     def total_threads(self) -> int:
@@ -89,6 +90,12 @@ def _dims3(values: list, what: str) -> tuple[int, int, int]:
     return dims
 
 
+def _smem_bytes(value: object, entry: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise CompileError(f"{entry}: smem_bytes must be a non-negative integer, got {value!r}")
+    return value
+
+
 def load_kernel(ir_path: Path) -> KernelSpec:
     ir_path = Path(ir_path)
     op = _kernel_op(_read_json(ir_path, "IR"), ir_path)
@@ -112,4 +119,5 @@ def load_kernel(ir_path: Path) -> KernelSpec:
         params=tuple(_buffer(args[name], op.name) for name in launch["arg_order"]),
         grid=_dims3(launch["grid"], "grid"),
         block=_dims3(launch["block"], "block"),
+        smem_bytes=_smem_bytes(launch.get("smem_bytes", 0), op.name),
     )

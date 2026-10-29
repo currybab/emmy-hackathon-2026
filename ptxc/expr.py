@@ -1,4 +1,4 @@
-"""Integer index expressions (Var / Literal / BinaryExpr trees) -> s32 values.
+"""Integer index expressions (Var / Literal / BinaryExpr / TernaryExpr trees) -> s32 values.
 
 An `IntValue` is either a Python int, known at compile time, or the name of a b32 register
 holding an s32. Keeping constants as ints lets whole subtrees fold away: the IR's
@@ -130,6 +130,18 @@ def lower_predicate(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) ->
     return compare(b, expr.op, left, right)
 
 
+def _select(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> IntValue:
+    """`cond ? if_true : if_false`; a condition known at compile time keeps one side."""
+    holds = lower_predicate(expr.cond, b, env)
+    if holds is True or holds is False:
+        return lower_int_expr(expr.if_true if holds else expr.if_false, b, env)
+    if_true = lower_int_expr(expr.if_true, b, env)
+    if_false = lower_int_expr(expr.if_false, b, env)
+    dst = b.reg("b32")
+    b.emit(f"selp.s32 {dst}, {if_true}, {if_false}, {holds}")
+    return dst
+
+
 def lower_int_expr(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> IntValue:
     """Compile an integer expression tree; `env` maps axis and index names to values."""
     kind = type(expr).__name__
@@ -145,4 +157,6 @@ def lower_int_expr(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> 
         left = lower_int_expr(expr.left, b, env)
         right = lower_int_expr(expr.right, b, env)
         return int_binop(b, expr.op, left, right)
+    if kind == "TernaryExpr":
+        return _select(expr, b, env)
     raise CompileError(f"index expression {kind} is not supported")
