@@ -5,42 +5,52 @@ multiply feeding an add into one `fma` - one instruction instead of two, rounded
 of twice. It is what nvcc does by default, so Emmy's reference kernels behave the same way.
 div/sqrt/rcp must name a rounding mode for f32; `.rn` is the IEEE-exact one.
 
-PTX has no natural exponential, only ex2 (2^x), so exp is two instructions:
-e^x = 2^(x * log2(e)). The destination register doubles as the temporary.
+Ops that need several instructions (exp, tanh, comparisons, ...) live in transcendental.py.
 """
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 
 from ptxc.builder import PtxBuilder, f32_literal
 from ptxc.errors import CompileError
+from ptxc.transcendental import COMPOSITE_OPS
 
 _ZERO = f32_literal(0.0)
-_LOG2_E = f32_literal(1 / math.log(2))
 
-# op name -> (arity, instruction template(s) over {d} destination and {a}, {b} sources)
-_F32_OPS: dict[str, tuple[int, str | tuple[str, ...]]] = {
+# op name -> (arity, instruction template over {d} destination and {a}, {b} sources)
+_F32_OPS: dict[str, tuple[int, str]] = {
     "add": (2, "add.f32 {d}, {a}, {b}"),
     "subtract": (2, "sub.f32 {d}, {a}, {b}"),
     "multiply": (2, "mul.f32 {d}, {a}, {b}"),
     "divide": (2, "div.rn.f32 {d}, {a}, {b}"),
     "maximum": (2, "max.f32 {d}, {a}, {b}"),
+    "minimum": (2, "min.f32 {d}, {a}, {b}"),
     "relu": (1, "max.f32 {d}, {a}, " + _ZERO),
     "copy": (1, "mov.f32 {d}, {a}"),
     "reciprocal": (1, "rcp.rn.f32 {d}, {a}"),
     "sqrt": (1, "sqrt.rn.f32 {d}, {a}"),
-    "exp": (1, ("mul.f32 {d}, {a}, " + _LOG2_E, "ex2.approx.f32 {d}, {d}")),
+    "rsqrt": (1, "rsqrt.approx.f32 {d}, {a}"),  # CUDA's rsqrtf is the same approximation
+    "negative": (1, "neg.f32 {d}, {a}"),
+    "abs": (1, "abs.f32 {d}, {a}"),
+    "square": (1, "mul.f32 {d}, {a}, {a}"),
 }
 
 
 def emit_elementwise(b: PtxBuilder, op: str, dst: str, args: Sequence[str]) -> None:
     """Emit `dst = op(*args)` for f32 registers."""
-    if op not in _F32_OPS:
+    if op in _F32_OPS:
+        arity, template = _F32_OPS[op]
+    elif op in COMPOSITE_OPS:
+        arity, lower = COMPOSITE_OPS[op]
+    else:
         raise CompileError(f"elementwise op {op!r} is not supported")
-    arity, template = _F32_OPS[op]
     if len(args) != arity:
         raise CompileError(f"elementwise op {op!r} takes {arity} operand(s), got {len(args)}")
-    operands = dict(zip("ab", args))
-    for instruction in (template,) if isinstance(template, str) else template:
-        b.emit(instruction.format(d=dst, **operands))
+    if op in _F32_OPS:
+        b.emit(template.format(d=dst, **dict(zip("ab", args))))
+    elif dst in args:  # an Accum folding in place: build the result aside, then move it
+        result = b.reg("f32")
+        lower(b, result, args)
+        b.emit(f"mov.f32 {dst}, {result}")
+    else:
+        lower(b, dst, args)
