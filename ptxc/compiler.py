@@ -1,4 +1,5 @@
-"""Kernel assembly: prologue (params, thread id, Tile decode, guard), body, epilogue."""
+"""Kernel assembly: prologue (params, thread id, Tile decode, guard), body, epilogue, then the
+load-merging pass over the finished body."""
 from __future__ import annotations
 
 import math
@@ -10,6 +11,7 @@ from ptxc.errors import CompileError
 from ptxc.expr import IntValue, int_binop, materialize
 from ptxc.loader import KernelSpec, load_kernel
 from ptxc.lower import BufferRef, Lowerer
+from ptxc.vectorize import merge_loads
 
 
 def compile_file(ir_path: Path) -> str:
@@ -31,6 +33,7 @@ def compile_kernel(spec: KernelSpec) -> str:
     exit_label = _guard(b, gid, cells) if spec.total_threads > cells else None
 
     Lowerer(b, buffers, ints, smem_pool_bytes=spec.smem_bytes).lower_body(tile.body)
+    b.replace_body(merge_loads(b.body_lines(), b.alignments()))
 
     if exit_label:
         b.place(exit_label)

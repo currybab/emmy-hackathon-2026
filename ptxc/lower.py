@@ -44,6 +44,7 @@ class BufferRef:
     shape: tuple[int, ...]
     base: str
     space: str  # "global" or "shared"
+    align: int = 16  # bytes the base address is aligned to (cudaMalloc gives at least 256)
 
 
 def _vector_suffix(width: int) -> str:
@@ -192,6 +193,7 @@ class Lowerer:
         self.b.emit(f"mul.wide.s32 {byte_offset}, {index}, {F32_BYTES}")
         self.b.emit(f"add.s64 {address}, {buf.base}, {byte_offset}")
         self.b.remember(key, address)
+        self.b.mark_alignment(address, math.gcd(buf.align, F32_BYTES * self.b.multiple_of(index)))
         return address
 
     def _addresses(self, buf: BufferRef, offset: Affine, groups: list) -> list[str]:
@@ -199,6 +201,7 @@ class Lowerer:
         variable, first = offset
         if isinstance(variable, int):
             base, first = buf.base, variable + first
+            self.b.mark_alignment(base, buf.align)
         else:
             base = self._element_address(buf, variable)
         operands = []
@@ -271,7 +274,7 @@ class Lowerer:
         else:
             self.b.declare_global(f".shared .align {align} .b8 {check_identifier(s.name)}[{nbytes}];")
             self.b.emit(f"mov.u64 {base}, {s.name}")
-        self.buffers[s.name] = BufferRef(s.name, extents, base, "shared")
+        self.buffers[s.name] = BufferRef(s.name, extents, base, "shared", min(align, POOL_ALIGN) if self.smem_pool_bytes else align)
 
     def _carve_from_pool(self, name: str, base: str, nbytes: int, align: int) -> None:
         """Past 48 KB a kernel cannot declare shared arrays statically: the launch hands it a

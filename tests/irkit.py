@@ -83,8 +83,8 @@ def cond(predicate, body, else_body=()) -> Cond:
     return Cond(cond=predicate, body=tuple(body), else_body=tuple(else_body))
 
 
-def smem(name: str, *extents: int) -> Smem:
-    return Smem(name=name, extents=tuple(extents), dtype="float", align=0)
+def smem(name: str, *extents: int, align: int = 0) -> Smem:
+    return Smem(name=name, extents=tuple(extents), dtype="float", align=align)
 
 
 def sync() -> Sync:

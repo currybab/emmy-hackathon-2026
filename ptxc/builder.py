@@ -54,6 +54,8 @@ class PtxBuilder:
         # integer results already computed on every path to the current point, by what they compute
         self._known: dict[tuple, str] = {}
         self._non_negative: set[str] = set()
+        self._multiple: dict[str, int] = {}  # s32 register -> a number it is known to be a multiple of
+        self._alignment: dict[str, int] = {}  # address register -> bytes its address is aligned to
 
     # ---- reuse of integer work ------------------------------------------------------------
 
@@ -78,6 +80,25 @@ class PtxBuilder:
 
     def is_non_negative(self, value: int | str) -> bool:
         return value >= 0 if isinstance(value, int) else value in self._non_negative
+
+    # ---- alignment, for vector loads ------------------------------------------------------
+
+    def mark_multiple(self, reg: str, factor: int) -> None:
+        self._multiple[reg] = factor
+
+    def multiple_of(self, value: int | str) -> int:
+        """A number `value` is a multiple of (0 for the constant 0, a multiple of everything)."""
+        return abs(value) if isinstance(value, int) else self._multiple.get(value, 1)
+
+    def mark_alignment(self, address: str, nbytes: int) -> None:
+        self._alignment[address] = nbytes
+
+    def alignments(self) -> dict[str, int]:
+        return dict(self._alignment)
+
+    def replace_body(self, lines: Sequence[str]) -> None:
+        """Swap in a rewritten body, such as the one with merged loads."""
+        self._lines = list(lines)
 
     def reg(self, cls: str) -> str:
         """A fresh virtual register of class `cls` (pred, b32, b64 or f32)."""

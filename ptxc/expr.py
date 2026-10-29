@@ -6,6 +6,7 @@ holding an s32. Keeping constants as ints lets whole subtrees fold away: the IR'
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 
 from ptxc.builder import PtxBuilder
@@ -85,6 +86,10 @@ def int_binop(b: PtxBuilder, op: str, left: IntValue, right: IntValue) -> IntVal
     b.emit(f"{_UNSIGNED[op] if unsigned else _INSTRUCTION[op]} {dst}, {left}, {right}")
     if unsigned or (op in _COMMUTATIVE and b.is_non_negative(left) and b.is_non_negative(right)):
         b.mark_non_negative(dst)
+    if op in ("+", "-"):
+        b.mark_multiple(dst, math.gcd(b.multiple_of(left), b.multiple_of(right)))
+    elif op == "*":
+        b.mark_multiple(dst, b.multiple_of(left) * b.multiple_of(right))
     b.remember(key, dst)
     return dst
 
@@ -97,6 +102,7 @@ def materialize(b: PtxBuilder, value: IntValue) -> str:
     b.emit(f"mov.s32 {dst}, {value}")
     if value >= 0:
         b.mark_non_negative(dst)
+    b.mark_multiple(dst, abs(value))
     return dst
 
 
