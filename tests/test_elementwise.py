@@ -27,6 +27,13 @@ def test_single_instruction_ops(op, args, expected):
     assert lines(b) == [expected]
 
 
+def test_exp_is_a_base_2_exponential_of_x_times_log2e():
+    # PTX has only ex2: e^x = 2^(x * log2(e)); the destination doubles as the temporary
+    b = PtxBuilder()
+    emit_elementwise(b, "exp", "%f9", ["%f1"])
+    assert lines(b) == ["mul.f32 %f9, %f1, 0f3FB8AA3B;", "ex2.approx.f32 %f9, %f9;"]
+
+
 def test_unknown_op_names_the_op():
     with pytest.raises(CompileError, match="tanh"):
         emit_elementwise(PtxBuilder(), "tanh", "%f9", ["%f1"])

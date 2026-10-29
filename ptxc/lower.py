@@ -65,6 +65,7 @@ class Lowerer:
         self._handlers = {
             "Load": self._load,
             "Assign": self._assign,
+            "Let": self._let,
             "Write": self._write,
             "Accum": self._accum,
             "StridedLoop": self._strided_loop,
@@ -161,6 +162,15 @@ class Lowerer:
         dst = self.b.reg("f32")
         emit_elementwise(self.b, s.op.name, dst, [self.value(a) for a in s.args])
         self.bind(s.name, dst)
+
+    def _let(self, s: object) -> None:
+        """A named f32 constant (`f32 one = 1.0`): one mov of its bit pattern."""
+        literal = s.value
+        if type(literal).__name__ != "Literal" or not isinstance(literal.value, float):
+            raise CompileError(f"Let {s.name!r}: only float literals are supported, got {literal!r}")
+        reg = self.b.reg("f32")
+        self.b.emit(f"mov.f32 {reg}, {f32_literal(literal.value)}")
+        self.bind(s.name, reg)
 
     def _write(self, s: object) -> None:
         if s.atomic:

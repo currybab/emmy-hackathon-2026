@@ -1,7 +1,10 @@
-"""StridedLoop, Accum and Cond on hand-built IR."""
+"""StridedLoop, Accum, Cond and Let on hand-built IR."""
 import pytest
 
-from irkit import accum, assign, binop, body_text, cond, lit, load, lowerer, strided_loop, var, write
+from emmy.compiler.dtype import F32
+from emmy.compiler.ir.stmt.leaves import Let
+
+from irkit import accum, assign, binop, body_text, cond, let, lit, load, lowerer, strided_loop, var, write
 from ptxc.errors import CompileError
 
 
@@ -91,3 +94,21 @@ def test_constant_true_cond_emits_only_its_body():
     b, lw = lowerer()
     lw.lower_body([cond(binop("<", lit(0), lit(1)), [load("in0", "x", lit(0))], [load("in1", "x", lit(1))])])
     assert body_text(b) == ["ld.global.f32 %f1, [%rd1];"]
+
+
+def test_let_binds_a_float_literal_to_a_register():
+    b, lw = lowerer()
+    lw.lower_body([let("one", 1.0)])
+    assert body_text(b) == ["mov.f32 %f1, 0f3F800000;"]
+
+
+def test_later_statements_can_use_a_let_name():
+    b, lw = lowerer()
+    lw.lower_body([let("one", 1.0), load("in0", "x", lit(0)), assign("y", "multiply", "in0", "one")])
+    assert "mul.f32 %f3, %f2, %f1;" in body_text(b)
+
+
+def test_let_of_a_non_float_value_fails_loudly():
+    b, lw = lowerer()
+    with pytest.raises(CompileError, match="Let 'i'"):
+        lw.lower_body([Let(name="i", value=var("a0"), dtype=F32)])

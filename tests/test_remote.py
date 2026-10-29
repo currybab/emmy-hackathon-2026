@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PROBLEMS = [
     "p00_scalar_add", "p01_vector_add", "p02_scale_shift", "p03_relu_mul",  # 1 pointwise
     "r01_array_sum", "r02_big_sum", "r03_mean", "r04_row_sum",  # 2 reductions
+    "f01_rmsnorm", "f02_row_softmax", "f03_l2norm",  # 4 fused
 ]
 
 pytestmark = [
