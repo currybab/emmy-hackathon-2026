@@ -96,6 +96,20 @@ class PtxBuilder:
     def alignments(self) -> dict[str, int]:
         return dict(self._alignment)
 
+    @contextmanager
+    def capture(self) -> Iterator[list[str]]:
+        """Collect what is emitted inside the block into a separate list instead of the body,
+        for a pass to look at before it is placed with `extend`."""
+        outer, self._lines = self._lines, []
+        captured = self._lines
+        try:
+            yield captured
+        finally:
+            self._lines = outer
+
+    def extend(self, lines: Sequence[str]) -> None:
+        self._lines.extend(lines)
+
     def replace_body(self, lines: Sequence[str]) -> None:
         """Swap in a rewritten body, such as the one with merged loads."""
         self._lines = list(lines)

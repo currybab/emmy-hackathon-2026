@@ -22,6 +22,7 @@ from ptxc.builder import PtxBuilder, check_identifier, f32_literal
 from ptxc.errors import CompileError
 from ptxc.expr import Affine, IntValue, affine_add, affine_scale, as_affine, lower_affine, lower_int_expr, lower_predicate
 from ptxc.elementwise import emit_elementwise
+from ptxc.licm import hoist_invariants
 
 F32_BYTES = 4
 VECTOR_WIDTHS = (1, 2, 4)  # PTX has v2 and v4 memory ops; other group sizes go one by one
@@ -346,7 +347,8 @@ class Lowerer:
         if self._may_unroll(s.body) and _unroll_factor(s.body, extent) > 1:
             self._partially_unrolled(s.axis.name, counter, extent, 1, s.body, _unroll_factor(s.body, extent))
         else:
-            self._counted_loop(s.axis.name, counter, extent, 1, s.body)
+            # a Loop runs its static extent (>= 1) times, so invariant loads may move out too
+            self._counted_loop(s.axis.name, counter, extent, 1, s.body, hoist_loads=extent >= 1)
 
     def _may_unroll(self, body: Sequence[object]) -> bool:
         """Whether the compiler may unroll a loop the IR did not ask to: its body only computes
@@ -396,18 +398,22 @@ class Lowerer:
         self._counted_loop(var, counter, end, step, body)
 
     def _counted_loop(self, var: str, counter: str, end: IntValue, step: IntValue,
-                      body: Sequence[object]) -> None:
-        """Top-tested loop; inside the body the axis variable `var` is the counter register."""
+                      body: Sequence[object], hoist_loads: bool = False) -> None:
+        """Top-tested loop; inside the body the axis variable `var` is the counter register.
+        Work that is the same in every iteration is placed before the loop (licm.py)."""
         top, done = self.b.label(f"{var}_loop"), self.b.label(f"{var}_done")
-        self.b.place(top)
         finished = self.b.reg("pred")
-        self.b.emit(f"setp.ge.s32 {finished}, {counter}, {end}")
-        self.b.emit(f"@{finished} bra {done}")
         outer = self.ints
         self.ints = {**outer, var: counter}
-        with self.b.region():
+        with self.b.capture() as lines, self.b.region():
             self.lower_body(body)
         self.ints = outer
+        hoisted, lines = hoist_invariants(lines, variant={counter}, allow_loads=hoist_loads)
+        self.b.extend(hoisted)
+        self.b.place(top)
+        self.b.emit(f"setp.ge.s32 {finished}, {counter}, {end}")
+        self.b.emit(f"@{finished} bra {done}")
+        self.b.extend(lines)
         self.b.emit(f"add.s32 {counter}, {counter}, {step}")
         self.b.emit(f"bra {top}")
         self.b.place(done)
