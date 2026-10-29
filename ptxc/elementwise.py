@@ -27,6 +27,7 @@ _F32_OPS: dict[str, tuple[int, str]] = {
     "minimum": (2, "min.f32 {d}, {a}, {b}"),
     "relu": (1, "max.f32 {d}, {a}, " + _ZERO),
     "copy": (1, "mov.f32 {d}, {a}"),
+    "pad": (1, "mov.f32 {d}, {a}"),  # Emmy renders it as its input, like copy
     "reciprocal": (1, "rcp.rn.f32 {d}, {a}"),
     "sqrt": (1, "sqrt.rn.f32 {d}, {a}"),
     "rsqrt": (1, "rsqrt.approx.f32 {d}, {a}"),  # CUDA's rsqrtf is the same approximation

@@ -33,6 +33,7 @@ def test_single_instruction_ops(op, args, expected):
     ("negative", ["%f1"], "neg.f32 %f9, %f1;"),
     ("abs", ["%f1"], "abs.f32 %f9, %f1;"),
     ("square", ["%f1"], "mul.f32 %f9, %f1, %f1;"),
+    ("pad", ["%f1"], "mov.f32 %f9, %f1;"),
 ])
 def test_more_single_instruction_ops(op, args, expected):
     b = PtxBuilder()
