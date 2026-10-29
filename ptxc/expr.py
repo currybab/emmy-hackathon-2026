@@ -133,6 +133,8 @@ def lower_affine(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> Af
     Only + - and multiplication by a constant distribute; / % and selects collapse first.
     """
     kind = type(expr).__name__
+    if kind == "Var" and isinstance(env.get(expr.name), tuple):
+        return env[expr.name]  # an unrolled copy's loop variable: counter + constant
     if kind in ("Literal", "Var"):
         return as_affine(lower_int_expr(expr, b, env))
     if kind == "BinaryExpr" and expr.op in ("+", "-", "*"):
@@ -218,7 +220,8 @@ def lower_int_expr(expr: object, b: PtxBuilder, env: Mapping[str, IntValue]) -> 
     if kind == "Var":
         if expr.name not in env:
             raise CompileError(f"index variable {expr.name!r} is not defined here")
-        return env[expr.name]
+        value = env[expr.name]
+        return affine_value(b, value) if isinstance(value, tuple) else value
     if kind == "BinaryExpr":
         left = lower_int_expr(expr.left, b, env)
         right = lower_int_expr(expr.right, b, env)

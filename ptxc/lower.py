@@ -25,7 +25,14 @@ from ptxc.elementwise import emit_elementwise
 
 F32_BYTES = 4
 VECTOR_WIDTHS = (1, 2, 4)  # PTX has v2 and v4 memory ops; other group sizes go one by one
-MAX_UNROLL = 128  # an unrolled Loop longer than this stays a loop
+# a Loop the IR asks to unroll stays a loop when its copies would exceed this many statements:
+# nvcc ignores such a #pragma unroll too, and ptxas time grows with the code (a01: 5 s vs 0.2 s)
+UNROLL_BUDGET = 1024
+# unrolling the compiler decides on itself, for loops whose bodies only compute and move data
+UNROLLABLE = {"Load", "Assign", "Accum", "Let", "Write"}
+FULL_UNROLL_BUDGET = 256  # statements a Loop may grow to when copied out whole
+MAX_PARTIAL_UNROLL = 16  # iterations per trip otherwise: enough loads in flight to hide DRAM
+PARTIAL_UNROLL_BUDGET = 64  # statements one trip may grow to
 SMEM_POOL = "smem_pool"
 POOL_ALIGN = 16
 
@@ -54,6 +61,27 @@ def _groups(regs: Sequence[str]) -> list[tuple[int, Sequence[str]]]:
     return [(i, [reg]) for i, reg in enumerate(regs)]
 
 
+def _unrolled_size(body: Sequence[object]) -> int:
+    """Statements in a body once every loop in it is copied out: the code an unroll creates."""
+    size = 0
+    for stmt in body:
+        nested = stmt.nested()
+        if type(stmt).__name__ in ("Loop", "StridedLoop"):
+            size += stmt.axis.extent.as_static() * sum(_unrolled_size(child) for child in nested)
+        else:
+            size += 1 + sum(_unrolled_size(child) for child in nested)
+    return size
+
+
+def _unroll_factor(body: Sequence[object], most_iterations: int) -> int:
+    """The largest power of two within the iteration count, the statement budget and the cap."""
+    limit = min(MAX_PARTIAL_UNROLL, most_iterations, PARTIAL_UNROLL_BUDGET // max(len(body), 1))
+    factor = 1
+    while factor * 2 <= limit:
+        factor *= 2
+    return factor
+
+
 def _describe(stmt: object) -> str:
     """The statement's first line in emmy's own IR notation, for a PTX comment."""
     pretty = getattr(stmt, "pretty", None)
@@ -62,7 +90,7 @@ def _describe(stmt: object) -> str:
 
 class Lowerer:
     def __init__(self, b: PtxBuilder, buffers: Mapping[str, BufferRef], ints: Mapping[str, IntValue],
-                 smem_pool_bytes: int = 0):
+                 smem_pool_bytes: int = 0, auto_unroll: bool = True):
         self.b = b
         self.buffers = dict(buffers)
         self.ints: dict[str, IntValue] = dict(ints)
@@ -70,6 +98,8 @@ class Lowerer:
         # > 0: the launch gives this much dynamic shared memory and Smem arrays live in it
         self.smem_pool_bytes = smem_pool_bytes
         self._pool_used = 0
+        self.auto_unroll = auto_unroll
+        self._copies = 0  # > 0 while lowering an unrolled copy of a loop body
         self._handlers = {
             "Load": self._load,
             "Assign": self._assign,
@@ -290,29 +320,77 @@ class Lowerer:
         self.b.emit(f"mov.s32 {counter}, {start}")
         if self.b.is_non_negative(start) and isinstance(step, int) and step > 0:
             self.b.mark_non_negative(counter)  # it only counts up from there
+        if self._may_unroll(s.body) and isinstance(step, int) and step > 0:
+            # a thread starting at 0 makes the most iterations; fewer caps the factor
+            most = -(-end // step) if isinstance(end, int) else MAX_PARTIAL_UNROLL
+            factor = _unroll_factor(s.body, most)
+            if factor > 1:
+                self._partially_unrolled(s.axis.name, counter, end, step, s.body, factor)
+                return
         self._counted_loop(s.axis.name, counter, end, step, s.body)
 
     def _loop(self, s: object) -> None:
         """for (axis = 0; axis < extent; axis++) body - unrolled when the IR asks for it."""
         self._seed_accumulators(s.body, s.seed)
         extent = s.axis.extent.as_static()
-        if s.unroll and extent <= MAX_UNROLL:
+        size = extent * _unrolled_size(s.body)
+        if (s.unroll and size <= UNROLL_BUDGET) or (self._may_unroll(s.body) and size <= FULL_UNROLL_BUDGET):
             self._unrolled(s.axis.name, extent, s.body)
             return
         counter = self.b.reg("b32")
         self.b.emit(f"mov.s32 {counter}, 0")
         self.b.mark_non_negative(counter)
-        self._counted_loop(s.axis.name, counter, extent, 1, s.body)
+        if self._may_unroll(s.body) and _unroll_factor(s.body, extent) > 1:
+            self._partially_unrolled(s.axis.name, counter, extent, 1, s.body, _unroll_factor(s.body, extent))
+        else:
+            self._counted_loop(s.axis.name, counter, extent, 1, s.body)
+
+    def _may_unroll(self, body: Sequence[object]) -> bool:
+        """Whether the compiler may unroll a loop the IR did not ask to: its body only computes
+        and moves data (no barrier, branch or nested loop), and it is not itself inside an
+        unrolled copy, where the copies would multiply."""
+        return (self.auto_unroll and self._copies == 0
+                and all(type(stmt).__name__ in UNROLLABLE for stmt in body))
 
     def _unrolled(self, var: str, extent: int, body: Sequence[object]) -> None:
         """One copy of the body per iteration, with the axis variable a compile-time int:
         index math on it folds away, so `tile[k][col]` becomes base + col + an immediate."""
         outer = self.ints
+        self._copies += 1
         for i in range(extent):
             self.b.comment(f"{var} = {i}")
             self.ints = {**outer, var: i}
             self.lower_body(body)
+        self._copies -= 1
         self.ints = outer
+
+    def _partially_unrolled(self, var: str, counter: str, end: IntValue, step: int,
+                            body: Sequence[object], factor: int) -> None:
+        """`factor` iterations per trip while that many remain, then a plain loop for the rest.
+
+        Copy j sees the axis as (counter, j*step): its index constant becomes an address
+        immediate, and the copies' loads are independent, so a thread has `factor` of them in
+        flight instead of one. The iterations still run in order, so results are unchanged.
+        """
+        top, rest = self.b.label(f"{var}_unrolled"), self.b.label(f"{var}_rest")
+        self.b.place(top)
+        with self.b.region():
+            last, finished = self.b.reg("b32"), self.b.reg("pred")
+            self.b.emit(f"add.s32 {last}, {counter}, {(factor - 1) * step}")
+            self.b.emit(f"setp.ge.s32 {finished}, {last}, {end}")
+            self.b.emit(f"@{finished} bra {rest}")
+            outer = self.ints
+            self._copies += 1
+            for j in range(factor):
+                self.b.comment(f"{var} = counter + {j * step}")
+                self.ints = {**outer, var: (counter, j * step)}
+                self.lower_body(body)
+            self._copies -= 1
+            self.ints = outer
+        self.b.emit(f"add.s32 {counter}, {counter}, {factor * step}")
+        self.b.emit(f"bra {top}")
+        self.b.place(rest)
+        self._counted_loop(var, counter, end, step, body)
 
     def _counted_loop(self, var: str, counter: str, end: IntValue, step: IntValue,
                       body: Sequence[object]) -> None:

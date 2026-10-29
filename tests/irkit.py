@@ -150,11 +150,13 @@ def cp_async_wait(groups: int) -> CpAsyncWait:
     return CpAsyncWait(group=groups)
 
 
-def lowerer(ints=None, buffers=("x", "out"), smem_pool_bytes: int = 0) -> tuple[PtxBuilder, Lowerer]:
-    """A Lowerer over 1-D global f32 buffers of 1024 elements each."""
+def lowerer(ints=None, buffers=("x", "out"), smem_pool_bytes: int = 0,
+            auto_unroll: bool = False) -> tuple[PtxBuilder, Lowerer]:
+    """A Lowerer over 1-D global f32 buffers of 1024 elements each. Loops stay loops unless
+    the IR asks to unroll them or `auto_unroll` lets the compiler decide."""
     b = PtxBuilder()
     refs = {name: BufferRef(name, (1024,), b.reg("b64"), "global") for name in buffers}
-    return b, Lowerer(b, refs, ints or {}, smem_pool_bytes=smem_pool_bytes)
+    return b, Lowerer(b, refs, ints or {}, smem_pool_bytes=smem_pool_bytes, auto_unroll=auto_unroll)
 
 
 def body_text(b: PtxBuilder) -> list[str]:
